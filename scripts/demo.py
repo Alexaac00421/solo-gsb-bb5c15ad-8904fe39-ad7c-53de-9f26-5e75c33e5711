@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""一键演示脚本：创建演练 -> 写入日志 -> 查询互证 -> 更正 -> 封存。
+"""一键演示脚本：创建演练 -> 写入日志 -> 查询互证 -> 更正 -> 锁定/隔离 ->
+批量裁决 -> 封存。
 
 用法：
     python scripts/demo.py [BASE_URL]
@@ -245,6 +246,70 @@ def main(base_url: str) -> None:
     show("批量恢复 R4/R5（按当前日志重新求解）", *call(
         "POST", f"{base_url}/drills/{drill}/quarantine/restore",
         {"record_nos": ["R4", "R5"]},
+    ))
+
+    # --- 复核员批量裁决：一次提交锁定/解除与隔离/恢复意图，按最终状态整批判定 ---
+    # 基准版本 = 演练当前版本（先查结果获取）
+    _st, cur = call("GET", f"{base_url}/drills/{drill}/result")
+    # 同批：锁定 (R1,R2) + 隔离 R4（R4 被隔离后其对方 R5 落单），整批只推进一次版本
+    show("批量裁决：锁定 (R1,R2) + 隔离 R4（一次提交，整批推进一次版本）", *call(
+        "POST", f"{base_url}/drills/{drill}/adjudications",
+        {"base_version": cur["version"],
+         "lock_intents": [{"action": "lock", "record_a": "R1", "record_b": "R2"}],
+         "quarantine_intents": [{"action": "quarantine", "record_no": "R4"}]},
+    ))
+
+    # 同一批意图重传（锁定已存在、隔离已存在）：无实际变化，版本不推进
+    _st, cur = call("GET", f"{base_url}/drills/{drill}/result")
+    show("重传同一批裁决（纯重传，版本应不变）", *call(
+        "POST", f"{base_url}/drills/{drill}/adjudications",
+        {"base_version": cur["version"],
+         "lock_intents": [{"action": "lock", "record_a": "R2", "record_b": "R1"}],
+         "quarantine_intents": [{"action": "quarantine", "record_no": "R4"}]},
+    ))
+
+    # 同一对象出现相反意图：整批拒绝、状态不变
+    show("同一对既锁定又解除（应 409 adjudication_intent_conflict）", *call(
+        "POST", f"{base_url}/drills/{drill}/adjudications",
+        {"base_version": cur["version"],
+         "lock_intents": [
+             {"action": "unlock", "record_a": "R1", "record_b": "R2"},
+             {"action": "lock", "record_a": "R2", "record_b": "R1"},
+         ]},
+    ))
+
+    # 最终状态同一记录既锁定又隔离：整批拒绝、状态不变
+    show("锁定 (R1,R2) 同时隔离 R1（应 409 lock_quarantine_conflict）", *call(
+        "POST", f"{base_url}/drills/{drill}/adjudications",
+        {"base_version": cur["version"],
+         "lock_intents": [{"action": "lock", "record_a": "R1", "record_b": "R2"}],
+         "quarantine_intents": [{"action": "quarantine", "record_no": "R1"}]},
+    ))
+
+    # 同批解除旧锁并隔离其成员：按最终状态判定，合法（单项接口须分两步）
+    show("同批解除 (R1,R2) 并隔离 R1（最终状态判定，合法）", *call(
+        "POST", f"{base_url}/drills/{drill}/adjudications",
+        {"base_version": cur["version"],
+         "lock_intents": [{"action": "unlock", "record_a": "R1", "record_b": "R2"}],
+         "quarantine_intents": [{"action": "quarantine", "record_no": "R1"}]},
+    ))
+
+    # 基准版本过期：整批拒绝、状态不变
+    show("以过期基准版本提交（应 409 adjudication_base_version_changed）", *call(
+        "POST", f"{base_url}/drills/{drill}/adjudications",
+        {"base_version": cur["version"],
+         "quarantine_intents": [{"action": "restore", "record_no": "R1"}]},
+    ))
+
+    # 同批恢复 R1/R4：回到无锁定、无隔离状态（恢复后按当前日志重新求解）
+    _st, cur = call("GET", f"{base_url}/drills/{drill}/result")
+    show("同批恢复 R1/R4（整批推进一次版本）", *call(
+        "POST", f"{base_url}/drills/{drill}/adjudications",
+        {"base_version": cur["version"],
+         "quarantine_intents": [
+             {"action": "restore", "record_no": "R1"},
+             {"action": "restore", "record_no": "R4"},
+         ]},
     ))
 
     show("封存演练", *call("POST", f"{base_url}/drills/{drill}/seal"))

@@ -268,6 +268,77 @@ Content-Type: application/json
   "record_nos": ["R3", "R3"]
 }
 
+### 复核员批量裁决：一次提交锁定/解除与隔离/恢复意图（整批按最终状态判定）
+### base_version 须等于演练当前版本（先 GET /result 查看），否则
+### 409 adjudication_base_version_changed；意图顺序不影响结果；
+### 同一对象同向重复只算一次，相反意图整批拒绝（409 adjudication_intent_conflict）。
+### 仅实际状态变化才推进一次版本并同事务留存快照；纯重传不推进。
+### 下面示例：同批解除 (R1,R2)、锁定 (R3,R4)、隔离 R5、恢复 R6。
+POST {{host}}/drills/{{drill}}/adjudications
+Content-Type: application/json
+
+{
+  "base_version": 0,
+  "lock_intents": [
+    {"action": "unlock", "record_a": "R1", "record_b": "R2"},
+    {"action": "lock", "record_a": "R3", "record_b": "R4"}
+  ],
+  "quarantine_intents": [
+    {"action": "quarantine", "record_no": "R5"},
+    {"action": "restore", "record_no": "R6"}
+  ]
+}
+
+### 同批解除旧锁并隔离其成员（最终状态判定，合法；单项接口须分两步）
+POST {{host}}/drills/{{drill}}/adjudications
+Content-Type: application/json
+
+{
+  "base_version": 0,
+  "lock_intents": [
+    {"action": "unlock", "record_a": "R1", "record_b": "R2"}
+  ],
+  "quarantine_intents": [
+    {"action": "quarantine", "record_no": "R1"}
+  ]
+}
+
+### 同批恢复并锁定（最终状态中记录未隔离，锁定合法）
+POST {{host}}/drills/{{drill}}/adjudications
+Content-Type: application/json
+
+{
+  "base_version": 0,
+  "lock_intents": [
+    {"action": "lock", "record_a": "R1", "record_b": "R2"}
+  ],
+  "quarantine_intents": [
+    {"action": "restore", "record_no": "R1"}
+  ]
+}
+
+### 拒绝示例（均整批拒绝、状态不变）：
+###   同一对象相反意图（409 adjudication_intent_conflict）
+###   最终状态同一记录既锁定又隔离（409 lock_quarantine_conflict）
+###   同一记录被多对锁定（409 record_already_locked）
+###   最终锁定对非互证候选（409 lock_not_candidate）
+###   引用不存在的记录（404 lock_record_missing / quarantine_record_missing）
+###   解除不存在的锁定（404 lock_not_found）
+###   基准版本过期（409 adjudication_base_version_changed）
+###   演练已封存（409 drill_sealed）；未知演练（404 drill_not_found）
+POST {{host}}/drills/{{drill}}/adjudications
+Content-Type: application/json
+
+{
+  "base_version": 0,
+  "lock_intents": [
+    {"action": "lock", "record_a": "R1", "record_b": "R2"}
+  ],
+  "quarantine_intents": [
+    {"action": "quarantine", "record_no": "R1"}
+  ]
+}
+
 ### 版本快照：列出已留存版本号（创建即有 0；升级前旧版本不出现）
 GET {{host}}/drills/{{drill}}/snapshots### 取回指定版本快照（配对/未配对/总时差/锁定清单；未留存版本 404 snapshot_not_found）
 GET {{host}}/drills/{{drill}}/snapshots/0

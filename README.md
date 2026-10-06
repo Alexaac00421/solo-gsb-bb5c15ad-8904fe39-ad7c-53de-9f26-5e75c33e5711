@@ -101,6 +101,10 @@
   状态变化时 `version + 1`（重复操作不推进、不留存快照）；被隔离记录
   不参与配对、不进入未配对清单/缺口诊断、不计入台站汇总；结果与隔离
   清单同事务写入新版本快照（详见 5.10 节）。
+- **复核员批量裁决**：一次提交锁定/解除与隔离/恢复意图，整批按最终
+  状态判定（意图顺序无关、同向重复只算一次、相反意图拒绝）；仅实际
+  状态变化时在单个事务内重算、`version + 1`（整批只推进一次）并留存
+  对应版本快照，纯重传不推进（详见 5.11 节）。
 
 ### 未互证日志缺口诊断（复核员查看未配对缺口）
 
@@ -182,6 +186,31 @@
   **历史快照保持原貌**；
 - 批量写入**预演与确认同样遵守隔离状态**（被隔离记录在拟写入结果中
   仍不参与配对）；现有写入、结果与快照接口保持兼容（详见 5.10 节）。
+
+### 复核员批量裁决（一次提交相互牵连的裁决）
+
+复核员可把一批**相互牵连**的裁决作为**一个批次**提交：输入**基准版本**
+（提交所基于的演练当前版本）与两类意图列表——**锁定/解除记录对**、
+**隔离/恢复记录**。整批按**最终状态**判定：
+
+- **意图顺序不影响结果**；同一对象的**重复同向意图只算一次**（含记录对
+  颠倒顺序、首尾空白差异），同一对象出现**相反意图**（锁定又解除、
+  隔离又恢复）则整批拒绝（`409 adjudication_intent_conflict`）；
+- 最终锁定集 =（现有锁定 − 本批解除）＋ 本批锁定，最终隔离集同理；
+  全部校验针对最终状态，因此**同批解除旧锁并隔离其成员、恢复并锁定、
+  解除旧锁后以同一记录锁定新对**均合法；
+- 下列任一情况**整批拒绝、状态不变**：引用不存在的记录
+  （`404 lock_record_missing` / `quarantine_record_missing`）、解除不存在
+  的锁定（`404 lock_not_found`）、最终锁定对不满足既有互证候选条件
+  （`409 lock_not_candidate`）、同一记录被多对锁定
+  （`409 record_already_locked`）、同一记录最终仍既锁定又隔离
+  （`409 lock_quarantine_conflict`）、演练已封存（`409 drill_sealed`）、
+  基准版本与当前版本不一致（`409 adjudication_base_version_changed`）；
+- 有效批次中**只有状态实际变化**才在**单个事务**内重算互证、
+  `version + 1`（整批只推进一次）并同事务留存对应版本快照；
+  **纯重传**（全部意图均不改变状态）不推进版本、不留存快照；
+- 响应返回**当前版本、实际生效的意图、锁定清单、隔离清单与完整互证
+  结果**；既有单项锁定/隔离接口及响应契约保持兼容（详见 5.11 节）。
 
 ---
 
@@ -935,6 +964,105 @@ curl http://127.0.0.1:8080/drills/DRILL-2026/quarantine
 关联约束：锁定被隔离记录 `409 lock_record_quarantined`、迁移被隔离
 记录 `409 transfer_record_quarantined`。封存后仍可查询隔离清单。
 
+### 5.11 复核员批量裁决（一次提交相互牵连的裁决）
+
+#### `POST /drills/{drill_id}/adjudications` —— 批量提交锁定/解除与隔离/恢复意图
+
+把一批相互牵连的裁决作为**一个批次**提交：请求体给出**基准版本**与
+两类意图列表，整批按**最终状态**判定，全部校验与落库在**单个事务**
+内完成；任一校验不过整批拒绝、状态不变。
+
+```bash
+curl -X POST http://127.0.0.1:8080/drills/DRILL-2026/adjudications \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "base_version": 3,
+    "lock_intents": [
+      {"action": "unlock", "record_a": "R1", "record_b": "R2"},
+      {"action": "lock",   "record_a": "R3", "record_b": "R4"}
+    ],
+    "quarantine_intents": [
+      {"action": "quarantine", "record_no": "R5"},
+      {"action": "restore",    "record_no": "R6"}
+    ]
+  }'
+```
+
+请求体：
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `base_version` | int | 提交所基于的演练当前版本；与当前版本不一致即整批拒绝（`409 adjudication_base_version_changed`） |
+| `lock_intents` | array | 锁定/解除记录对的意图列表，可省略；`action` 取 `lock` / `unlock`，`record_a` / `record_b` 顺序任意 |
+| `quarantine_intents` | array | 隔离/恢复记录的意图列表，可省略；`action` 取 `quarantine` / `restore` |
+
+判定规则（整批按最终状态，意图顺序不影响结果）：
+
+- 同一对象（记录对按内部升序、记录号）的**重复同向意图只算一次**；
+  **相反意图**（锁定又解除、隔离又恢复）整批拒绝
+  （`409 adjudication_intent_conflict`）；
+- 最终锁定集 =（现有锁定 − 本批解除）＋ 本批锁定，最终隔离集同理；
+  **同批解除旧锁并隔离其成员、恢复并锁定、解除旧锁后以同一记录锁定
+  新对**均合法；
+- 整批拒绝（状态不变）的情形：引用不存在的记录
+  （`404 lock_record_missing` / `quarantine_record_missing`）、解除不存在
+  的锁定（`404 lock_not_found`）、最终锁定对不满足互证候选条件
+  （`409 lock_not_candidate`）、同一记录被多对锁定
+  （`409 record_already_locked`）、同一记录最终仍既锁定又隔离
+  （`409 lock_quarantine_conflict`）、演练已封存（`409 drill_sealed`）、
+  基准版本过期（`409 adjudication_base_version_changed`）、未知演练
+  （`404 drill_not_found`）、锁定对的两个记录号相同
+  （`422 lock_same_record`）；
+- 已是目标状态的同向意图为**幂等重传**（如锁定已锁定的对、隔离已隔离
+  的记录、恢复未隔离的记录），不产生状态变化。
+
+响应 `200`：
+
+```json
+{
+  "drill_id": "DRILL-2026",
+  "base_version": 3,
+  "version": 4,
+  "version_advanced": true,
+  "applied": {
+    "locked":   [{"record_a": "R3", "record_b": "R4"}],
+    "unlocked": [{"record_a": "R1", "record_b": "R2"}],
+    "quarantined": ["R5"],
+    "restored":    ["R6"]
+  },
+  "locks": [
+    {"record_a": "R3", "record_b": "R4",
+     "time_diff_seconds": 8.0,
+     "locked_at": "2026-10-06T01:00:00.000000+00:00"}
+  ],
+  "quarantine": [
+    {"record_no": "R5",
+     "quarantined_at": "2026-10-06T01:00:00.000000+00:00"}
+  ],
+  "result": {
+    "drill_id": "DRILL-2026",
+    "version": 4,
+    "sealed": false,
+    "pairs": [{"record_a": "R3", "record_b": "R4", "time_diff_seconds": 8.0}],
+    "unpaired": ["R1", "R2"],
+    "total_time_diff_seconds": 8.0,
+    "recomputed_at": "2026-10-06T01:00:00.000000+00:00"
+  }
+}
+```
+
+- `version`：裁决后的**当前版本**。有实际状态变化时整批只推进一次
+  （`base_version + 1`），重算结果与锁定/隔离清单同事务写入新版本
+  快照；**纯重传**（全部意图均不改变状态）时 `version_advanced` 为
+  `false`，版本不推进、不留存快照；
+- `applied`：本批**实际生效**的意图（锁定对内部升序、各列表升序）；
+  幂等重传的意图不在其内；
+- `locks` / `quarantine`：裁决后的**完整**锁定清单（按记录对升序）与
+  隔离清单（按记录号升序），与 `GET /locks`、`GET /quarantine` 一致；
+- `result`：重算后的完整互证结果，结构与 `GET /result` 完全一致；
+- 空批次（两个意图列表均省略或为空）合法，等价于纯重传：校验基准版本
+  后返回当前状态，不推进版本。
+
 ---
 
 ## 6. 错误响应与状态码
@@ -948,9 +1076,9 @@ curl http://127.0.0.1:8080/drills/DRILL-2026/quarantine
 | 时间缺时区信息 | `422` | `时间必须携带时区信息，例如 2026-10-04T08:00:00+08:00` |
 | 本台呼号与对方呼号相同 | `422` | `本台呼号与对方呼号不能相同` |
 | 记录号/呼号/波段/模式为空 | `422` | 对应字段不能为空 |
-| 未知演练（查询/写入/封存/锁定/缺口诊断/台站汇总/隔离） | `404` | `drill_not_found` |
+| 未知演练（查询/写入/封存/锁定/缺口诊断/台站汇总/隔离/批量裁决） | `404` | `drill_not_found` |
 | 演练号已存在 | `409` | `drill_exists` |
-| 写入/封存/锁定/隔离/恢复已封存演练 | `409` | `drill_sealed`（封存后查询仍 `200`） |
+| 写入/封存/锁定/隔离/恢复/批量裁决已封存演练 | `409` | `drill_sealed`（封存后查询仍 `200`） |
 | 批次内记录号重复 | `409` | `duplicate_record_in_batch` |
 | 锁定的两个记录号相同 | `422` | `lock_same_record` |
 | 锁定引用了不存在的记录 | `404` | `lock_record_missing` |
@@ -972,6 +1100,9 @@ curl http://127.0.0.1:8080/drills/DRILL-2026/quarantine
 | 隔离/恢复批次涉及人工锁定中的记录 | `409` | `quarantine_record_locked`（已有锁定成员不得隔离，请先解除锁定） |
 | 锁定被隔离的记录 | `409` | `lock_record_quarantined`（隔离记录不得人工锁定，请先恢复） |
 | 迁移被隔离的记录 | `409` | `transfer_record_quarantined`（整次拒绝、两端状态不变；请先恢复） |
+| 批量裁决同一对象出现相反意图（锁定又解除/隔离又恢复） | `409` | `adjudication_intent_conflict`（整批拒绝、状态不变） |
+| 批量裁决基准版本与演练当前版本不一致 | `409` | `adjudication_base_version_changed`（按最新版本重新提交） |
+| 批量裁决最终状态同一记录既被锁定又被隔离 | `409` | `lock_quarantine_conflict`（两者互斥；可同批先解除再隔离或先恢复再锁定） |
 
 ---
 
@@ -983,14 +1114,15 @@ curl http://127.0.0.1:8080/drills/DRILL-2026/quarantine
 │   ├── main.py          # FastAPI 路由、异常处理、lifespan 初始化
 │   ├── schemas.py       # 请求/响应模型与输入校验（时区/负值/同呼号）
 │   ├── database.py      # SQLite 持久化、事务、版本/封存/锁定/隔离/快照/批量预演
-│   │                    #   与按台站汇总、跨演练日志迁移（两端原子提交）
+│   │                    #   与按台站汇总、跨演练日志迁移（两端原子提交）、
+│   │                    #   复核员批量裁决（最终状态整批判定，单事务推进一次版本）
 │   ├── matching.py      # 配对核心算法（二分图最小费用最大流，支持强制锁定）
 │   │                    #   与未配对缺口诊断（diagnose_gaps）
 │   └── config.py        # 环境变量配置
 ├── scripts/
 │   ├── init_db.py       # 数据初始化（建库/建表/WAL/旧库快照回填，幂等）
 │   └── demo.py          # 端到端调用演示（含版本回看/比较、缺口诊断、
-│                        #   台站汇总，纯标准库）
+│                        #   台站汇总、批量裁决，纯标准库）
 ├── tests/               # 算法单测（含穷举对照）+ HTTP 集成测试（含快照）
 ├── examples/requests.http
 ├── Dockerfile
