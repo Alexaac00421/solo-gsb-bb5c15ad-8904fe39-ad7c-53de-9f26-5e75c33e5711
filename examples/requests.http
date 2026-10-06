@@ -268,6 +268,61 @@ Content-Type: application/json
   "record_nos": ["R3", "R3"]
 }
 
+### 复核员批量裁决：锁定/解除与隔离/恢复意图一次提交，按最终状态整批判定
+### base_version 须等于演练当前版本（先 GET /result 查看），否则
+### 409 adjudication_base_version_changed；意图顺序不影响结果；
+### 重复同向意图只算一次；同一对象相反意图 409 adjudication_intent_conflict。
+### 下例：解除旧锁 (R1,R2) 并隔离 R2、恢复 R5、锁定 (R3,R4) —— 一个事务，
+### 有实际变化时整批只推进一次版本并留存快照；纯重传不推进。
+POST {{host}}/drills/{{drill}}/adjudications
+Content-Type: application/json
+
+{
+  "base_version": 0,
+  "locks": [
+    {"action": "unlock", "record_a": "R1", "record_b": "R2"},
+    {"action": "lock",   "record_a": "R3", "record_b": "R4"}
+  ],
+  "quarantine": [
+    {"action": "quarantine", "record_no": "R2"},
+    {"action": "restore",    "record_no": "R5"}
+  ]
+}
+
+### 同批恢复并锁定（最终状态无冲突，可受理）
+POST {{host}}/drills/{{drill}}/adjudications
+Content-Type: application/json
+
+{
+  "base_version": 0,
+  "locks": [
+    {"action": "lock", "record_a": "R1", "record_b": "R2"}
+  ],
+  "quarantine": [
+    {"action": "restore", "record_no": "R2"}
+  ]
+}
+
+### 批量裁决拒绝示例（均整批拒绝、状态不变）：
+###   同一对象相反意图（409 adjudication_intent_conflict）
+###   引用不存在的记录（404 adjudication_record_missing）
+###   最终锁定对不满足互证候选条件（409 lock_not_candidate）
+###   同一记录被多对锁定（409 record_already_locked）
+###   最终锁定对成员仍处于隔离状态（409 lock_record_quarantined）
+###   基准版本过期（409 adjudication_base_version_changed）
+###   演练已封存（409 drill_sealed）；未知演练（404 drill_not_found）
+###   两个意图列表全空（422）；锁定意图两记录号相同（422 lock_same_record）
+POST {{host}}/drills/{{drill}}/adjudications
+Content-Type: application/json
+
+{
+  "base_version": 0,
+  "locks": [
+    {"action": "lock",   "record_a": "R1", "record_b": "R2"},
+    {"action": "unlock", "record_a": "R2", "record_b": "R1"}
+  ]
+}
+
 ### 版本快照：列出已留存版本号（创建即有 0；升级前旧版本不出现）
 GET {{host}}/drills/{{drill}}/snapshots### 取回指定版本快照（配对/未配对/总时差/锁定清单；未留存版本 404 snapshot_not_found）
 GET {{host}}/drills/{{drill}}/snapshots/0

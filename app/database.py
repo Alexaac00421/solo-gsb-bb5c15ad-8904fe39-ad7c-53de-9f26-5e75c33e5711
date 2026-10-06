@@ -283,6 +283,27 @@ class TransferRecordQuarantinedError(ServiceError):
     error_code = "transfer_record_quarantined"
 
 
+class AdjudicationIntentConflictError(ServiceError):
+    """批量裁决中同一对象（记录对/记录）出现相反意图，无法判定最终状态。"""
+
+    status_code = 409
+    error_code = "adjudication_intent_conflict"
+
+
+class AdjudicationBaseVersionChangedError(ServiceError):
+    """提交批量裁决时演练当前版本已不同于基准版本。"""
+
+    status_code = 409
+    error_code = "adjudication_base_version_changed"
+
+
+class AdjudicationRecordMissingError(ServiceError):
+    """批量裁决引用了不存在的记录。"""
+
+    status_code = 404
+    error_code = "adjudication_record_missing"
+
+
 # --------------------------------------------------------------------------
 # 连接管理
 # --------------------------------------------------------------------------
@@ -1553,6 +1574,196 @@ def list_quarantine(drill_id: str) -> dict:
                 "drill_id": drill_id,
                 "quarantine": _quarantine_items(conn, drill_id),
                 "result": _result_from_conn(conn, drill_id),
+            }
+    finally:
+        conn.close()
+
+
+# --------------------------------------------------------------------------
+# 复核员批量裁决（一次提交锁定/解除与隔离/恢复意图）
+#
+# 整批按最终状态判定：意图顺序不影响结果；重复同向意图只算一次；同一对象
+# 出现相反意图整批拒绝。引用不存在的记录、最终锁定对不满足既有互证候选
+# 条件、同一记录被多对锁定或最终仍处于隔离状态、演练已封存、基准版本过期
+# 均整批拒绝且状态不变。同批解除旧锁并隔离、恢复并锁定均可（按最终状态
+# 合成，天然兼容）。仅实际状态变化时在单个事务内重算互证、推进一次版本并
+# 留存对应快照；纯重传不推进版本、不留存快照。
+# --------------------------------------------------------------------------
+def _prepare_adjudication_intents(
+    lock_intents: Iterable[dict],
+    quarantine_intents: Iterable[dict],
+) -> tuple[
+    list[tuple[str, str]], list[tuple[str, str]], list[str], list[str]
+]:
+    """规范化裁决意图并做请求形状校验（先于演练状态检查）。
+
+    记录对内部升序；同向重复意图去重（保留请求顺序）；同一对象出现相反
+    意图（同一记录对既锁定又解除、同一记录既隔离又恢复）整批拒绝。
+    返回 (锁定对, 解除对, 隔离记录, 恢复记录) 四个去重后的请求顺序列表。
+    """
+    lock_keys: list[tuple[str, str]] = []
+    unlock_keys: list[tuple[str, str]] = []
+    for it in lock_intents:
+        a, b = _normalize_pair(it["record_a"], it["record_b"])
+        if a == b:
+            raise LockSameRecordError(f"两条记录号不能相同: {a}")
+        target = lock_keys if it["action"] == "lock" else unlock_keys
+        if (a, b) not in target:
+            target.append((a, b))
+    pair_conflict = sorted(set(lock_keys) & set(unlock_keys))
+    if pair_conflict:
+        a, b = pair_conflict[0]
+        raise AdjudicationIntentConflictError(
+            f"同一记录对出现相反意图: ({a}, {b}) 既锁定又解除，"
+            "无法判定最终状态"
+        )
+
+    quar_nos: list[str] = []
+    restore_nos: list[str] = []
+    for it in quarantine_intents:
+        no = it["record_no"]
+        target = quar_nos if it["action"] == "quarantine" else restore_nos
+        if no not in target:
+            target.append(no)
+    quar_conflict = sorted(set(quar_nos) & set(restore_nos))
+    if quar_conflict:
+        raise AdjudicationIntentConflictError(
+            f"同一记录出现相反意图: {quar_conflict[0]} 既隔离又恢复，"
+            "无法判定最终状态"
+        )
+    return lock_keys, unlock_keys, quar_nos, restore_nos
+
+
+def submit_adjudication(
+    drill_id: str,
+    base_version: int,
+    lock_intents: Iterable[dict],
+    quarantine_intents: Iterable[dict],
+) -> dict:
+    """复核员批量裁决：锁定/解除与隔离/恢复意图一次提交，按最终状态整批判定。
+
+    全部校验在单个写事务内完成；任一不满足即整批回滚、状态不变。
+    有实际状态变化时整批只推进一次版本，重算结果与锁定/隔离清单在同一
+    事务写入新版本快照；纯重传（全部意图均已是目标状态）不推进版本。
+    """
+    lock_keys, unlock_keys, quar_nos, restore_nos = (
+        _prepare_adjudication_intents(lock_intents, quarantine_intents)
+    )
+
+    conn = connect()
+    try:
+        with _write_tx(conn):
+            drill = _get_drill_row(conn, drill_id)
+            _require_unsealed(drill)
+            if drill["version"] != base_version:
+                raise AdjudicationBaseVersionChangedError(
+                    f"演练 {drill_id} 当前版本 {drill['version']} 与基准版本 "
+                    f"{base_version} 不一致，请重新获取当前状态后再提交裁决"
+                )
+
+            # 任一意图引用不存在的记录 -> 整批拒绝
+            records = _load_records(conn, drill_id)
+            rmap = _record_map(records)
+            referenced: list[str] = []
+            for a, b in lock_keys + unlock_keys:
+                referenced.extend((a, b))
+            referenced.extend(quar_nos + restore_nos)
+            missing = sorted({no for no in referenced if no not in rmap})
+            if missing:
+                raise AdjudicationRecordMissingError(
+                    f"演练 {drill_id} 中记录不存在: " + ", ".join(missing)
+                )
+
+            # 最终状态按集合合成：意图顺序不影响结果。已是目标状态的意图
+            # （重复锁定/解除未锁定/重复隔离/恢复未隔离）自动跳过。
+            current_locks = set(_load_lock_keys(conn, drill_id))
+            current_quar = _load_quarantine_nos(conn, drill_id)
+            final_locks = (current_locks - set(unlock_keys)) | set(lock_keys)
+            final_quar = (current_quar - set(restore_nos)) | set(quar_nos)
+
+            # 最终锁定对须全部满足既有互证候选条件（现存/互指/波段模式/时差）。
+            allowed_micros = int(
+                round(drill["allowed_diff_secs"] * MICROS_PER_SECOND)
+            )
+            for a, b in sorted(final_locks):
+                _check_lock_candidate(rmap, allowed_micros, a, b)
+
+            # 同一记录不得被多对锁定占用。
+            used: dict[str, tuple[str, str]] = {}
+            for a, b in sorted(final_locks):
+                for no in (a, b):
+                    if no in used:
+                        oa, ob = used[no]
+                        raise LockOccupiedError(
+                            f"记录 {no} 被多个锁定对占用: "
+                            f"({oa}, {ob}) 与 ({a}, {b})"
+                        )
+                    used[no] = (a, b)
+
+            # 最终状态下锁定与隔离互斥（同批解除旧锁并隔离、恢复并锁定
+            # 在最终状态中不冲突，均可受理）。
+            still_quarantined = sorted(set(used) & final_quar)
+            if still_quarantined:
+                raise LockRecordQuarantinedError(
+                    "最终状态下记录仍处于隔离状态，不能作为锁定对成员: "
+                    + ", ".join(still_quarantined)
+                )
+
+            # 仅实际状态变化落库；纯重传不推进版本、不留存快照。
+            to_lock = [k for k in lock_keys if k not in current_locks]
+            to_unlock = [k for k in unlock_keys if k in current_locks]
+            to_quar = [no for no in quar_nos if no not in current_quar]
+            to_restore = [no for no in restore_nos if no in current_quar]
+            changed = bool(to_lock or to_unlock or to_quar or to_restore)
+            if changed:
+                now = _now_iso()
+                for a, b in to_unlock:
+                    conn.execute(
+                        "DELETE FROM locks WHERE drill_id = ? AND "
+                        "record_a = ? AND record_b = ?",
+                        (drill_id, a, b),
+                    )
+                for a, b in to_lock:
+                    conn.execute(
+                        "INSERT INTO locks (drill_id, record_a, record_b, "
+                        "created_at) VALUES (?, ?, ?, ?)",
+                        (drill_id, a, b, now),
+                    )
+                if to_restore:
+                    placeholders = ",".join("?" for _ in to_restore)
+                    conn.execute(
+                        f"DELETE FROM quarantine WHERE drill_id = ? AND "
+                        f"record_no IN ({placeholders})",
+                        (drill_id, *to_restore),
+                    )
+                for no in to_quar:
+                    conn.execute(
+                        "INSERT INTO quarantine (drill_id, record_no, "
+                        "created_at) VALUES (?, ?, ?)",
+                        (drill_id, no, now),
+                    )
+                # 整批只推进一次版本：重算结果与锁定/隔离清单同事务留存快照。
+                _recompute(conn, drill_id)
+
+            result = _result_from_conn(conn, drill_id)
+            return {
+                "drill_id": drill_id,
+                "base_version": base_version,
+                "version": result["version"],
+                "version_advanced": changed,
+                "applied": {
+                    "locked": [
+                        {"record_a": a, "record_b": b} for a, b in to_lock
+                    ],
+                    "unlocked": [
+                        {"record_a": a, "record_b": b} for a, b in to_unlock
+                    ],
+                    "quarantined": to_quar,
+                    "restored": to_restore,
+                },
+                "locks": _lock_items(conn, drill_id, rmap),
+                "quarantine": _quarantine_items(conn, drill_id),
+                "result": result,
             }
     finally:
         conn.close()

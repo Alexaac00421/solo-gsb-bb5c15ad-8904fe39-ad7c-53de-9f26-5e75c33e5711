@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import re
 from datetime import datetime, timezone
+from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -404,6 +405,103 @@ class QuarantineListResponse(StrictModel):
 
     drill_id: str
     quarantine: list[QuarantineItem]
+    result: ResultResponse
+
+
+# --------------------------------------------------------------------------
+# 复核员批量裁决（一次提交锁定/解除与隔离/恢复意图，按最终状态整批判定）
+# --------------------------------------------------------------------------
+class AdjudicationLockIntent(StrictModel):
+    """锁定/解除意图：一对记录号（顺序任意，服务端内部升序）。"""
+
+    action: Literal["lock", "unlock"] = Field(
+        ..., description="lock=锁定该记录对；unlock=解除该记录对的锁定"
+    )
+    record_a: str = Field(..., description="第一条记录号（演练内现存）")
+    record_b: str = Field(..., description="第二条记录号（演练内现存）")
+
+    @field_validator("record_a", "record_b")
+    @classmethod
+    def _record_no(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError("记录号不能为空")
+        return v
+
+
+class AdjudicationQuarantineIntent(StrictModel):
+    """隔离/恢复意图：单条记录号。"""
+
+    action: Literal["quarantine", "restore"] = Field(
+        ..., description="quarantine=隔离该记录；restore=恢复该记录"
+    )
+    record_no: str = Field(..., description="记录号（演练内现存）")
+
+    @field_validator("record_no")
+    @classmethod
+    def _record_no(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError("记录号不能为空")
+        return v
+
+
+class AdjudicationRequest(StrictModel):
+    """批量裁决请求：基准版本 + 锁定/解除意图列表 + 隔离/恢复意图列表。
+
+    整批按最终状态判定：意图顺序无关；重复同向意图只算一次；同一对象
+    出现相反意图整批拒绝。两个列表至少提交一条意图。
+    """
+
+    base_version: int = Field(
+        ..., ge=0, description="基准版本（演练当前版本须仍为该版本）"
+    )
+    locks: list[AdjudicationLockIntent] = Field(
+        default_factory=list, description="锁定/解除记录对意图列表"
+    )
+    quarantine: list[AdjudicationQuarantineIntent] = Field(
+        default_factory=list, description="隔离/恢复记录意图列表"
+    )
+
+    @model_validator(mode="after")
+    def _at_least_one_intent(self) -> "AdjudicationRequest":
+        if not self.locks and not self.quarantine:
+            raise ValueError("锁定/解除与隔离/恢复意图至少提交一条")
+        return self
+
+
+class PairRef(StrictModel):
+    """一对记录号（内部升序）。"""
+
+    record_a: str
+    record_b: str
+
+
+class AdjudicationApplied(StrictModel):
+    """本批实际生效的状态变化（请求顺序；纯重传时各项为空）。"""
+
+    locked: list[PairRef] = Field(..., description="本批实际锁定的记录对")
+    unlocked: list[PairRef] = Field(..., description="本批实际解除的记录对")
+    quarantined: list[str] = Field(..., description="本批实际隔离的记录号")
+    restored: list[str] = Field(..., description="本批实际恢复的记录号")
+
+
+class AdjudicationResponse(StrictModel):
+    """批量裁决响应：当前版本、锁定与隔离清单及完整互证结果。"""
+
+    drill_id: str
+    base_version: int
+    version: int = Field(
+        ..., description="当前版本（有实际变化时 = 基准版本 + 1，纯重传不变）"
+    )
+    version_advanced: bool = Field(
+        ..., description="本批是否有实际状态变化并推进了一次版本"
+    )
+    applied: AdjudicationApplied
+    locks: list[LockItem] = Field(..., description="当前完整锁定清单（按记录对升序）")
+    quarantine: list[QuarantineItem] = Field(
+        ..., description="当前完整隔离清单（按记录号升序）"
+    )
     result: ResultResponse
 
 

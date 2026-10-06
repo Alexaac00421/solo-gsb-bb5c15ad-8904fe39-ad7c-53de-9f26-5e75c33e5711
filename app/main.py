@@ -10,6 +10,8 @@ from fastapi.responses import JSONResponse
 from . import database
 from .config import http_host, http_port
 from .schemas import (
+    AdjudicationRequest,
+    AdjudicationResponse,
     BatchLogsRequest,
     BatchPreviewResponse,
     ConfirmBatchRequest,
@@ -42,12 +44,12 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="应急无线电演练通联日志互证服务",
-    version="1.7.0",
+    version="1.8.0",
     description=(
         "记录各台站通联日志，按相互指认、波段/模式一致、时差不超限的"
         "规则完成全场最优配对（最大配对数 → 最小总时差 → 字典序最小），"
         "支持版本化更正、并发原子写入、演练封存、按台站汇总配对覆盖率"
-        "与争议日志隔离。"
+        "与争议日志隔离，以及复核员锁定/解除与隔离/恢复的批量裁决。"
     ),
     lifespan=lifespan,
 )
@@ -295,6 +297,26 @@ def restore_quarantined_logs(
 )
 def list_quarantine(drill_id: str) -> dict:
     return database.list_quarantine(drill_id)
+
+
+# --------------------------------------------------------------------------
+# 复核员批量裁决：锁定/解除与隔离/恢复意图一次提交，按最终状态整批判定；
+# 仅实际状态变化推进一次版本并留存快照，纯重传不推进
+# --------------------------------------------------------------------------
+@app.post(
+    "/drills/{drill_id}/adjudications",
+    response_model=AdjudicationResponse,
+    tags=["adjudications"],
+    status_code=200,
+    summary="复核员批量裁决：锁定/解除与隔离/恢复一次提交，按最终状态整批判定",
+)
+def submit_adjudication(drill_id: str, payload: AdjudicationRequest) -> dict:
+    return database.submit_adjudication(
+        drill_id,
+        payload.base_version,
+        [intent.model_dump() for intent in payload.locks],
+        [intent.model_dump() for intent in payload.quarantine],
+    )
 
 
 # --------------------------------------------------------------------------

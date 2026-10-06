@@ -247,6 +247,59 @@ def main(base_url: str) -> None:
         {"record_nos": ["R4", "R5"]},
     ))
 
+    # --- 复核员批量裁决：锁定/解除与隔离/恢复一次提交，按最终状态整批判定 ---
+    status, cur = call("GET", f"{base_url}/drills/{drill}/result")
+    base_v = cur["version"]
+
+    # 一次提交相互牵连的裁决：锁定 (R3,R6) + 隔离 R5，
+    # 一个事务内整批判定，有实际变化时只推进一次版本并留存快照
+    show("批量裁决：锁定 (R3,R6) + 隔离 R5（整批只推进一次版本）", *call(
+        "POST", f"{base_url}/drills/{drill}/adjudications",
+        {"base_version": base_v,
+         "locks": [{"action": "lock", "record_a": "R3", "record_b": "R6"}],
+         "quarantine": [{"action": "quarantine", "record_no": "R5"}]},
+    ))
+
+    # 纯重传：重复锁定已锁定的 (R3,R6)、重复隔离 R5 -> 版本不推进
+    show("纯重传批量裁决（版本应不变）", *call(
+        "POST", f"{base_url}/drills/{drill}/adjudications",
+        {"base_version": base_v + 1,
+         "locks": [{"action": "lock", "record_a": "R6", "record_b": "R3"}],
+         "quarantine": [{"action": "quarantine", "record_no": "R5"}]},
+    ))
+
+    # 同一对象出现相反意图 -> 409 adjudication_intent_conflict，状态不变
+    show("同一记录对既锁定又解除（应 409 adjudication_intent_conflict）",
+         *call(
+        "POST", f"{base_url}/drills/{drill}/adjudications",
+        {"base_version": base_v + 1,
+         "locks": [{"action": "lock", "record_a": "R1", "record_b": "R2"},
+                   {"action": "unlock", "record_a": "R2", "record_b": "R1"}]},
+    ))
+
+    # 基准版本过期 -> 409 adjudication_base_version_changed，状态不变
+    show("基准版本过期（应 409 adjudication_base_version_changed）", *call(
+        "POST", f"{base_url}/drills/{drill}/adjudications",
+        {"base_version": base_v,
+         "locks": [{"action": "lock", "record_a": "R1", "record_b": "R2"}]},
+    ))
+
+    # 同批解除旧锁并隔离：解除 (R3,R6) + 隔离 R6（最终状态无冲突，可受理）
+    show("同批解除旧锁 (R3,R6) 并隔离 R6", *call(
+        "POST", f"{base_url}/drills/{drill}/adjudications",
+        {"base_version": base_v + 1,
+         "locks": [{"action": "unlock", "record_a": "R3", "record_b": "R6"}],
+         "quarantine": [{"action": "quarantine", "record_no": "R6"}]},
+    ))
+
+    # 同批恢复并锁定：恢复 R6 + 重新锁定 (R3,R6)（最终状态无冲突，可受理）
+    show("同批恢复 R6 并重新锁定 (R3,R6)", *call(
+        "POST", f"{base_url}/drills/{drill}/adjudications",
+        {"base_version": base_v + 2,
+         "locks": [{"action": "lock", "record_a": "R3", "record_b": "R6"}],
+         "quarantine": [{"action": "restore", "record_no": "R6"}]},
+    ))
+
     show("封存演练", *call("POST", f"{base_url}/drills/{drill}/seal"))
 
     # 封存不产生新快照；封存状态从现态读取（旧快照 sealed 也为 true）
